@@ -61,6 +61,9 @@ inputs:
     description: 'Whether to send a comment under PR with the link to the generated build'
     required: false
     default: true
+  custom-identifier:
+    description: 'Custom identifier used in artifact naming for re-sign and ad-hoc flows to distinguish builds with the same native fingerprint'
+    required: false
 
 outputs:
   artifact-url:
@@ -182,6 +185,7 @@ runs:
         mkdir -p .rock/cache
         echo "{\"githubToken\": \"${{ inputs.github-token }}\"}" > .rock/cache/project.json
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
 
     # We create PR-related artifacts to avoid overwriting the main artifact with new JS bundle
     - name: Check if PR-related artifact exists
@@ -197,6 +201,7 @@ runs:
           echo "ARTIFACT_NAME=$(echo "$OUTPUT" | jq -r '.name')" >> $GITHUB_ENV
         fi
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
 
     - name: Check if regular artifact exists
       if: ${{ !env.ARTIFACT_NAME }}
@@ -211,6 +216,7 @@ runs:
           echo "ARTIFACT_NAME=$(echo "$OUTPUT" | jq -r '.name')" >> $GITHUB_ENV
         fi
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
 
     - name: Set Artifact Name (if not set)
       if: ${{ !env.ARTIFACT_NAME }}
@@ -219,6 +225,23 @@ runs:
         ARTIFACT_TRAITS_HYPHENATED=$(echo "$ARTIFACT_TRAITS" | tr ',' '-')
         ARTIFACT_TRAITS_HYPHENATED_FINGERPRINT="${ARTIFACT_TRAITS_HYPHENATED}-${FINGERPRINT}"
         echo "ARTIFACT_NAME=rock-ios-${ARTIFACT_TRAITS_HYPHENATED_FINGERPRINT}" >> $GITHUB_ENV
+      shell: bash
+
+    - name: Set Identifier
+      if: ${{ inputs.re-sign == 'true' || inputs.ad-hoc == 'true' }}
+      run: |
+        if [ -n "${{ inputs.custom-identifier }}" ]; then
+          IDENTIFIER="${{ inputs.custom-identifier }}"
+          if ! echo "$IDENTIFIER" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+            echo "Invalid 'custom-identifier': '$IDENTIFIER'. Use only alphanumeric characters, hyphens, dots, and underscores."
+            exit 1
+          fi
+        elif [ "${{ github.event_name }}" = "pull_request" ]; then
+          IDENTIFIER="${{ github.event.pull_request.number }}"
+        else
+          IDENTIFIER=$(echo "$GITHUB_SHA" | cut -c1-7)
+        fi
+        echo "IDENTIFIER=$IDENTIFIER" >> $GITHUB_ENV
       shell: bash
 
     - name: Set Provisioning Profile Path
@@ -362,6 +385,7 @@ runs:
           echo "ARTIFACT_PATH=$ARTIFACT_PATH" >> $GITHUB_ENV
         fi
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
 
     - name: Download and Unpack IPA
       if: ${{ env.ARTIFACT_URL && inputs.destination == 'device' && inputs.re-sign == 'true' }}
@@ -370,6 +394,7 @@ runs:
         IPA_PATH=$(echo "$DOWNLOAD_OUTPUT" | jq -r '.path')
         echo "ARTIFACT_PATH=$IPA_PATH" >> $GITHUB_ENV
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
 
     - name: Download and Unpack APP
       if: ${{ env.ARTIFACT_URL && inputs.destination == 'simulator' && inputs.re-sign == 'true' }}
@@ -385,6 +410,7 @@ runs:
         echo "ARTIFACT_PATH=$APP_PATH" >> $GITHUB_ENV
         echo "ARTIFACT_TAR_PATH=$EXTRACTED_APP" >> $GITHUB_ENV
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
 
     - name: Re-sign IPA
       if: ${{ env.ARTIFACT_URL && inputs.destination == 'device' && inputs.re-sign == 'true' }}
@@ -413,14 +439,11 @@ runs:
         tar -C "$APP_DIR" -czf "$ARTIFACT_PATH" "$APP_BASENAME"
       shell: bash
 
+    # Non-ad-hoc re-sign flow: add identifier to ARTIFACT_NAME so the re-signed ZIP Artifact doesn't overwrite the base ZIP.
+    # Skipped for ad-hoc — ARTIFACT_NAME stays fingerprint-only (one ZIP Artifact per fingerprint).
     - name: Update Artifact Name for re-signed builds
-      if: ${{ env.ARTIFACT_URL && inputs.re-sign == 'true' }}
+      if: ${{ env.ARTIFACT_URL && inputs.re-sign == 'true' && inputs.ad-hoc != 'true' }}
       run: |
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          IDENTIFIER="${{ github.event.pull_request.number }}"
-        else
-          IDENTIFIER=$(echo "$GITHUB_SHA" | cut -c1-7)
-        fi
         ARTIFACT_TRAITS="${{ inputs.destination }},${{ inputs.configuration }},${IDENTIFIER}"
         ARTIFACT_TRAITS_HYPHENATED=$(echo "$ARTIFACT_TRAITS" | tr ',' '-')
         ARTIFACT_TRAITS_HYPHENATED_FINGERPRINT="${ARTIFACT_TRAITS_HYPHENATED}-${FINGERPRINT}"
@@ -439,6 +462,7 @@ runs:
           echo "ARTIFACT_ID=$(echo "$OUTPUT" | jq -r '.id')" >> $GITHUB_ENV
         fi
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
 
     # Special case for GitHub, as it doesn't support uploading through the API
     - name: Upload Artifact to GitHub
@@ -450,36 +474,58 @@ runs:
         path: ${{ env.ARTIFACT_PATH }}
         if-no-files-found: error
 
+
+    # Non-ad-hoc re-sign flow: upload ZIP Artifact with {identifier}-{fingerprint} name
     # For re-signed builds, the ARTIFACT_NAME may contain PR-number, while Rock will save the artifact without PR trait in its cache.
     # We need to upload the artifact with the PR-number in the name, that's why we use --binary-path with appropriate ARTIFACT_PATH that accounts for it.
-    - name: Upload Artifact to Remote Cache for re-signed builds
-      if: ${{ env.PROVIDER_NAME != 'GitHub' && inputs.re-sign == 'true' }}
+    - name: Upload re-signed ZIP Artifact for non-ad-hoc flow
+      if: ${{ env.PROVIDER_NAME != 'GitHub' && inputs.re-sign == 'true' && inputs.ad-hoc != 'true' }}
       run: |
         OUTPUT=$(npx rock remote-cache upload --name ${{ env.ARTIFACT_NAME }} --binary-path "${{ env.ARTIFACT_PATH }}" --json) || (echo "$OUTPUT" && exit 1)
         echo "ARTIFACT_URL=$(echo "$OUTPUT" | jq -r '.url')" >> $GITHUB_ENV
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
 
-    - name: Upload Artifact to Remote Cache for regular builds
-      if: ${{ env.PROVIDER_NAME != 'GitHub' && inputs.re-sign != 'true' && !env.ARTIFACT_URL }}
+    # Upload ZIP Artifact with {fingerprint}-only name as base ZIP Artifact for caching only (first build only).
+    # Runs only when no cached artifact exists (!ARTIFACT_URL), meaning native build was done from scratch.
+    # Excludes non-ad-hoc re-sign, which uploads with identifier in the name.
+    # Applies to:
+    # - regular builds (no ad-hoc, no re-sign)
+    # - re-sign with ad-hoc
+    - name: Upload ZIP Artifact for caching
+      if: ${{ env.PROVIDER_NAME != 'GitHub' && !env.ARTIFACT_URL && (inputs.re-sign != 'true' || inputs.ad-hoc == 'true') }}
       run: |
         OUTPUT=$(npx rock remote-cache upload --name ${{ env.ARTIFACT_NAME }} --json) || (echo "$OUTPUT" && exit 1)
         echo "ARTIFACT_URL=$(echo "$OUTPUT" | jq -r '.url')" >> $GITHUB_ENV
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
 
-    # For ad-hoc builds, the ARTIFACT_NAME may contain PR-number, while Rock will save the artifact without PR trait in its cache.
-    # We need to upload the artifact with the PR-number in the name, that's why we use --binary-path with appropriate ARTIFACT_PATH that accounts for it.
+
+    # Ad-hoc uploads always include an identifier in the name {identifier}-{fingerprint}
+    - name: Set Ad-Hoc Artifact Name
+      if: ${{ inputs.ad-hoc == 'true' }}
+      run: |
+        ADHOC_TRAITS="${{ inputs.destination }},${{ inputs.configuration }},${IDENTIFIER}"
+        ADHOC_TRAITS_HYPHENATED=$(echo "$ADHOC_TRAITS" | tr ',' '-')
+        echo "ADHOC_ARTIFACT_NAME=rock-ios-${ADHOC_TRAITS_HYPHENATED}-${FINGERPRINT}" >> $GITHUB_ENV
+      shell: bash
+
+    # Uploads IPA + index.html + manifest.plist under ad-hoc/{ADHOC_ARTIFACT_NAME}/.
+    # The ARTIFACT_URL output points to index.html
     - name: Upload for Ad-hoc distribution
       if: ${{ env.PROVIDER_NAME != 'GitHub' && inputs.ad-hoc == 'true' }}
       run: |
-        OUTPUT=$(npx rock remote-cache upload --name ${{ env.ARTIFACT_NAME }} --binary-path "${{ env.ARTIFACT_PATH }}" --json --ad-hoc) || (echo "$OUTPUT" && exit 1)
+        OUTPUT=$(npx rock remote-cache upload --name ${{ env.ADHOC_ARTIFACT_NAME }} --binary-path "${{ env.ARTIFACT_PATH }}" --json --ad-hoc) || (echo "$OUTPUT" && exit 1)
         echo "ARTIFACT_URL=$(echo "$OUTPUT" | jq -r '.url')" >> $GITHUB_ENV
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
 
     - name: Delete Old Re-Signed Artifacts
       if: ${{ env.ARTIFACT_URL && inputs.re-sign == 'true' && github.event_name == 'pull_request' }}
       run: |
         npx rock remote-cache delete --name ${{ env.ARTIFACT_NAME }} --all-but-latest --json
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
 
     - name: Clean Up Code Signing (device builds only)
       if: ${{ inputs.re-sign == 'true' && inputs.destination == 'device' || (!env.ARTIFACT_URL && inputs.destination == 'device') }}
@@ -516,6 +562,7 @@ runs:
       run: |
         rm -rf .rock/cache/project.json
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
 
     - name: Post Build
       if: ${{ github.event_name == 'pull_request' && inputs.comment-bot == 'true' }}
